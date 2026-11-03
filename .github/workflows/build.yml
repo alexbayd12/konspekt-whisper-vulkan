@@ -1,0 +1,68 @@
+name: Сборка whisper.cpp с Vulkan (Windows x64)
+
+# Запуск вручную: Actions → «Сборка whisper.cpp…» → Run workflow.
+on:
+  workflow_dispatch:
+    inputs:
+      whisper_tag:
+        description: Версия whisper.cpp (тег в ggml-org/whisper.cpp)
+        default: v1.9.5
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Исходный код whisper.cpp (официальный)
+        uses: actions/checkout@v4
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ inputs.whisper_tag }}
+          path: whisper.cpp
+
+      - name: Vulkan SDK
+        shell: pwsh
+        run: |
+          curl.exe -sSL -o "$env:RUNNER_TEMP\vulkan-sdk.exe" https://sdk.lunarg.com/sdk/download/latest/windows/vulkan-sdk.exe
+          Start-Process -Wait -FilePath "$env:RUNNER_TEMP\vulkan-sdk.exe" -ArgumentList "--accept-licenses","--default-answer","--confirm-command","install"
+          $sdk = Get-ChildItem C:\VulkanSDK | Sort-Object Name | Select-Object -Last 1
+          Write-Host "Vulkan SDK: $($sdk.FullName)"
+          "VULKAN_SDK=$($sdk.FullName)" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+          "$($sdk.FullName)\Bin" | Out-File -Append -Encoding utf8 $env:GITHUB_PATH
+
+      - name: Сборка
+        shell: pwsh
+        working-directory: whisper.cpp
+        run: |
+          cmake -B build -DGGML_VULKAN=ON -DGGML_NATIVE=OFF -DBUILD_SHARED_LIBS=ON -DWHISPER_BUILD_TESTS=OFF -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release -j 4
+
+      - name: Проверка и упаковка
+        shell: pwsh
+        run: |
+          $bin = "whisper.cpp\build\bin\Release"
+          if (-not (Test-Path "$bin\whisper-cli.exe")) { Get-ChildItem -Recurse whisper.cpp\build -Filter *.exe | Select-Object FullName; throw "whisper-cli.exe не собран" }
+          & "$bin\whisper-cli.exe" --help 2>&1 | Select-Object -First 5
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item "$bin\*.exe", "$bin\*.dll" dist\
+          Copy-Item whisper.cpp\LICENSE dist\LICENSE-whisper.cpp.txt
+          $tag = "${{ inputs.whisper_tag }}"
+          $name = "whisper-vulkan-win-x64-$tag.zip"
+          Compress-Archive -Path dist\* -DestinationPath $name
+          $hash = (Get-FileHash $name -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name" | Out-File -Encoding ascii "$name.sha256"
+          Write-Host "$name — $([math]::Round((Get-Item $name).Length / 1MB, 1)) МБ, SHA-256 $hash"
+          "ZIP=$name" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Релиз
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "vulkan-${{ inputs.whisper_tag }}"
+          gh release create $tag $env:ZIP "$env:ZIP.sha256" --repo ${{ github.repository }} `
+            --title "whisper.cpp ${{ inputs.whisper_tag }} + Vulkan (Windows x64)" `
+            --notes "Собрано автоматически из официального кода [ggml-org/whisper.cpp](https://github.com/ggml-org/whisper.cpp/tree/${{ inputs.whisper_tag }}) с GGML_VULKAN=ON. Видеокарты AMD, Intel и NVIDIA на Windows 10/11 (нужен драйвер с поддержкой Vulkan). Контрольная сумма — в файле .sha256."
